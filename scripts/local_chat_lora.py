@@ -6,16 +6,28 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import select
+import sys
+import termios
 import threading
+import tty
 from typing import Any
 
 import torch
 from peft import PeftModel
-from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
+from transformers import AutoModelForCausalLM, AutoTokenizer, StoppingCriteria, StoppingCriteriaList, TextIteratorStreamer
 
 
 DEFAULT_MODEL_PATH = "/root/autodl-tmp/Qwen3.5-4B"
 DEFAULT_LORA_PATH = "/root/autodl-tmp/UniAlign-dpo-safe-lora"
+
+
+class StopOnEvent(StoppingCriteria):
+    def __init__(self, stop_event: threading.Event):
+        self.stop_event = stop_event
+
+    def __call__(self, input_ids, scores, **kwargs) -> bool:
+        return self.stop_event.is_set()
 
 
 def parse_args():
@@ -125,6 +137,19 @@ def generation_kwargs(args, tokenizer) -> dict[str, Any]:
     return kwargs
 
 
+def listen_for_escape(stop_event: threading.Event, done_event: threading.Event) -> None:
+    if not sys.stdin.isatty():
+        return
+    while not done_event.is_set() and not stop_event.is_set():
+        readable, _, _ = select.select([sys.stdin], [], [], 0.05)
+        if not readable:
+            continue
+        if sys.stdin.read(1) == "\x1b":
+            stop_event.set()
+            print("\n[ESC pressed: stopping generation]", flush=True)
+            return
+
+
 def generate_response(model, tokenizer, messages: list[dict[str, str]], args) -> str:
     prompt = apply_chat_template(tokenizer, messages)
     inputs = tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
@@ -137,20 +162,46 @@ def generate_response(model, tokenizer, messages: list[dict[str, str]], args) ->
         generated = output[0, inputs["input_ids"].shape[-1]:]
         return tokenizer.decode(generated, skip_special_tokens=True).strip()
 
+    stop_event = threading.Event()
+    done_event = threading.Event()
     streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
     thread = threading.Thread(
         target=model.generate,
-        kwargs={**inputs, **kwargs, "streamer": streamer},
+        kwargs={
+            **inputs,
+            **kwargs,
+            "streamer": streamer,
+            "stopping_criteria": StoppingCriteriaList([StopOnEvent(stop_event)]),
+        },
     )
     thread.start()
 
+    old_terminal_attrs = None
+    escape_thread = None
     chunks = []
-    print("\nAssistant> ", end="", flush=True)
-    for text in streamer:
-        chunks.append(text)
-        print(text, end="", flush=True)
-    thread.join()
-    print()
+    try:
+        if sys.stdin.isatty():
+            old_terminal_attrs = termios.tcgetattr(sys.stdin.fileno())
+            tty.setcbreak(sys.stdin.fileno())
+            escape_thread = threading.Thread(
+                target=listen_for_escape,
+                args=(stop_event, done_event),
+                daemon=True,
+            )
+            escape_thread.start()
+
+        print("\nAssistant> ", end="", flush=True)
+        for text in streamer:
+            chunks.append(text)
+            print(text, end="", flush=True)
+    finally:
+        done_event.set()
+        thread.join()
+        if escape_thread is not None:
+            escape_thread.join(timeout=0.2)
+        if old_terminal_attrs is not None:
+            termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old_terminal_attrs)
+        print()
     return "".join(chunks).strip()
 
 
