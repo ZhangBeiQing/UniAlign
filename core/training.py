@@ -116,6 +116,28 @@ def create_tokenizer(model_path: str) -> AutoTokenizer:
     return tokenizer
 
 
+def apply_chat_template_text(
+    tokenizer: AutoTokenizer,
+    messages: list[dict[str, str]],
+    add_generation_prompt: bool,
+    enable_thinking: bool = False,
+) -> str:
+    try:
+        return tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=add_generation_prompt,
+            enable_thinking=enable_thinking,
+        )
+    except TypeError:
+        return tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=add_generation_prompt,
+            chat_template_kwargs={"enable_thinking": enable_thinking},
+        )
+
+
 class CheckpointLoggingCallback(TrainerCallback):
     def on_save(self, args, state, control, **kwargs):
         checkpoint_logger = get_logger("Checkpointing")

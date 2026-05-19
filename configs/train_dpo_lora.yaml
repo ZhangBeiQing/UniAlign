@@ -5,6 +5,7 @@ model:
 
 data:
   path: reward_seed.json
+  enable_thinking: false
   max_length: 2048
 
 output:

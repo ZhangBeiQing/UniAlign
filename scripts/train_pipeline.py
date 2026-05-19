@@ -30,6 +30,7 @@ from trl import DPOConfig, DPOTrainer, SFTConfig, SFTTrainer
 from core.logging import get_logger, init_script_logger
 from core.training import (
     CheckpointLoggingCallback,
+    apply_chat_template_text,
     build_model,
     configure_wandb,
     create_tokenizer,
@@ -42,8 +43,8 @@ from core.training import (
 
 DEFAULT_MODEL_PATH = "/root/autodl-tmp/Qwen3.5-4B-ortho"
 DEFAULT_DATA_PATH = "reward_seed.json"
-DEFAULT_SFT_DIR = "/root/autodl-tmp/UniAlign-sft-lora"
-DEFAULT_DPO_DIR = "/root/autodl-tmp/UniAlign-dpo-lora"
+DEFAULT_SFT_DIR = "/root/autodl-tmp/UniAlign-sft-ortho-lora"
+DEFAULT_DPO_DIR = "/root/autodl-tmp/UniAlign-dpo-ortho-lora"
 DEFAULT_CONFIG_PATH = REPO_ROOT / "configs" / "train_pipeline.yaml"
 ENV_PATH = REPO_ROOT / ".env"
 
@@ -113,7 +114,10 @@ def parse_args() -> argparse.Namespace:
     sft_lora = sft_cfg.get("lora", {})
     dpo_lora_defaults = dpo_cfg.get("lora", sft_lora)
 
-    args.sft_target = args.sft_target or sft_cfg.get("target", "rejected")
+    args.sft_target = args.sft_target or sft_cfg.get("target", "chosen")
+    args.sft_exclude_indices = set(sft_cfg.get("exclude_indices", []))
+    args.sft_max_target_chars = sft_cfg.get("max_target_chars")
+    args.sft_enable_thinking = bool(sft_cfg.get("enable_thinking", False))
     args.sft_max_length = args.sft_max_length if args.sft_max_length is not None else sft_cfg.get("max_length", 1024)
     args.sft_epochs = args.sft_epochs if args.sft_epochs is not None else sft_cfg.get("epochs", 5.0)
     args.sft_max_steps = args.sft_max_steps if args.sft_max_steps is not None else sft_cfg.get("max_steps", -1)
@@ -137,6 +141,7 @@ def parse_args() -> argparse.Namespace:
     args.dpo_lora_alpha = args.dpo_lora_alpha if args.dpo_lora_alpha is not None else dpo_lora_defaults.get("alpha", 32)
     args.dpo_lora_dropout = dpo_lora_defaults.get("dropout", 0.05)
     args.dpo_seed = args.dpo_seed if args.dpo_seed is not None else dpo_cfg.get("seed", 42)
+    args.dpo_enable_thinking = bool(dpo_cfg.get("enable_thinking", False))
 
     common_logging = sft_cfg if "logging_steps" in sft_cfg else dpo_cfg
     args.logging_steps = args.logging_steps if args.logging_steps is not None else common_logging.get("logging_steps", 1)
@@ -162,28 +167,53 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def load_sft_dataset(data_path: str | Path, tokenizer: AutoTokenizer, target: str) -> Dataset:
+def load_sft_dataset(
+    data_path: str | Path,
+    tokenizer: AutoTokenizer,
+    target: str,
+    exclude_indices: set[int] | None = None,
+    max_target_chars: int | None = None,
+    enable_thinking: bool = False,
+) -> Dataset:
     path = Path(data_path)
     with path.open("r", encoding="utf-8") as f:
         rows = json.load(f)
 
     skipped = 0
     examples: list[dict[str, str]] = []
+    exclude_indices = exclude_indices or set()
     for idx, row in enumerate(rows):
+        if idx in exclude_indices:
+            skipped += 1
+            DATA_LOGGER.info("Skipped SFT row index=%d because it is configured in exclude_indices", idx)
+            continue
         if not row.get("instruction") or not row.get(target):
             skipped += 1
             continue
+        if max_target_chars is not None and len(row[target]) > max_target_chars:
+            skipped += 1
+            DATA_LOGGER.info(
+                "Skipped SFT row index=%d because %s length=%d exceeds max_target_chars=%d",
+                idx,
+                target,
+                len(row[target]),
+                max_target_chars,
+            )
+            continue
 
-        messages = [
-            {"role": "user", "content": row["instruction"].strip()},
-            {"role": "assistant", "content": row[target].strip()},
-        ]
-        text = tokenizer.apply_chat_template(
+        messages = [{"role": "user", "content": row["instruction"].strip()}]
+        prompt = apply_chat_template_text(
+            tokenizer,
             messages,
-            tokenize=False,
-            add_generation_prompt=False,
+            add_generation_prompt=True,
+            enable_thinking=enable_thinking,
         )
-        examples.append({"text": text})
+        completion = row[target].strip()
+        if not completion:
+            skipped += 1
+            continue
+
+        examples.append({"prompt": prompt, "completion": completion})
 
     if not examples:
         raise ValueError(f"{path} does not contain any training examples")
@@ -191,7 +221,11 @@ def load_sft_dataset(data_path: str | Path, tokenizer: AutoTokenizer, target: st
     return Dataset.from_list(examples)
 
 
-def load_dpo_dataset(data_path: str | Path, tokenizer: AutoTokenizer) -> Dataset:
+def load_dpo_dataset(
+    data_path: str | Path,
+    tokenizer: AutoTokenizer,
+    enable_thinking: bool = False,
+) -> Dataset:
     path = Path(data_path)
     with path.open("r", encoding="utf-8") as f:
         rows = json.load(f)
@@ -204,10 +238,11 @@ def load_dpo_dataset(data_path: str | Path, tokenizer: AutoTokenizer) -> Dataset
             continue
 
         messages = [{"role": "user", "content": row["instruction"].strip()}]
-        prompt = tokenizer.apply_chat_template(
+        prompt = apply_chat_template_text(
+            tokenizer,
             messages,
-            tokenize=False,
             add_generation_prompt=True,
+            enable_thinking=enable_thinking,
         )
 
         examples.append(
@@ -342,7 +377,14 @@ def run_sft_phase(args: argparse.Namespace, tokenizer: AutoTokenizer) -> None:
     )
     log_effective_batch(args.sft_batch_size, args.sft_grad_accum)
 
-    train_dataset = load_sft_dataset(args.data_path, tokenizer, args.sft_target)
+    train_dataset = load_sft_dataset(
+        args.data_path,
+        tokenizer,
+        args.sft_target,
+        exclude_indices=args.sft_exclude_indices,
+        max_target_chars=args.sft_max_target_chars,
+        enable_thinking=args.sft_enable_thinking,
+    )
     model = build_model(args.model_path, use_4bit=args.use_4bit)
     log_cuda_memory("after-model-load")
 
@@ -377,7 +419,7 @@ def run_sft_phase(args: argparse.Namespace, tokenizer: AutoTokenizer) -> None:
         remove_unused_columns=False,
         optim="adamw_torch_fused",
         seed=args.sft_seed,
-        dataset_text_field="text",
+        completion_only_loss=True,
         packing=args.sft_packing,
     )
 
@@ -444,7 +486,11 @@ def run_dpo_phase(args: argparse.Namespace, tokenizer: AutoTokenizer) -> None:
     )
     log_effective_batch(args.dpo_batch_size, args.dpo_grad_accum)
 
-    train_dataset = load_dpo_dataset(args.data_path, tokenizer)
+    train_dataset = load_dpo_dataset(
+        args.data_path,
+        tokenizer,
+        enable_thinking=args.dpo_enable_thinking,
+    )
 
     base_model = build_model(args.model_path, use_4bit=args.use_4bit)
     SCRIPT_LOGGER.info("Loading SFT adapter from %s", args.sft_output_dir)

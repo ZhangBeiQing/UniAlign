@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""SFT LoRA fine-tuning entrypoint for Qwen-style chat models.
-
-By default trains on the 'rejected' field (safe responses).
-Override via --data-path config or pipeline config's sft.target.
-"""
+"""SFT LoRA fine-tuning entrypoint for Qwen-style chat models."""
 
 from __future__ import annotations
 
@@ -18,17 +14,14 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from dotenv import load_dotenv
-import yaml
-
-import torch
 from datasets import Dataset
 from peft import LoraConfig
-from transformers import AutoTokenizer
 from trl import SFTConfig, SFTTrainer
 
 from core.logging import get_logger, init_script_logger
 from core.training import (
     CheckpointLoggingCallback,
+    apply_chat_template_text,
     build_model,
     configure_wandb,
     create_tokenizer,
@@ -39,9 +32,9 @@ from core.training import (
 )
 
 
-DEFAULT_MODEL_PATH = "/root/autodl-tmp/Qwen3.5-4B"
+DEFAULT_MODEL_PATH = "/root/autodl-tmp/Qwen3.5-4B-ortho"
 DEFAULT_DATA_PATH = "reward_seed.json"
-DEFAULT_OUTPUT_DIR = "/root/autodl-tmp/UniAlign-sft-safe-lora"
+DEFAULT_OUTPUT_DIR = "/root/autodl-tmp/UniAlign-sft-ortho-lora"
 DEFAULT_CONFIG_PATH = REPO_ROOT / "configs" / "train_sft_lora.yaml"
 ENV_PATH = REPO_ROOT / ".env"
 
@@ -57,6 +50,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-path")
     parser.add_argument("--data-path")
     parser.add_argument("--output-dir")
+    parser.add_argument("--target", choices=["chosen", "rejected"])
     parser.add_argument("--max-length", type=int)
     parser.add_argument("--epochs", type=float)
     parser.add_argument("--max-steps", type=int)
@@ -93,6 +87,10 @@ def parse_args() -> argparse.Namespace:
     args.model_path = args.model_path or model_cfg.get("path", DEFAULT_MODEL_PATH)
     args.data_path = args.data_path or data_cfg.get("path", DEFAULT_DATA_PATH)
     args.output_dir = args.output_dir or output_cfg.get("dir", DEFAULT_OUTPUT_DIR)
+    args.target = args.target or data_cfg.get("target", "chosen")
+    args.exclude_indices = set(data_cfg.get("exclude_indices", []))
+    args.max_target_chars = data_cfg.get("max_target_chars")
+    args.enable_thinking = bool(data_cfg.get("enable_thinking", False))
     args.max_length = args.max_length if args.max_length is not None else data_cfg.get("max_length", 1024)
     args.epochs = args.epochs if args.epochs is not None else training_cfg.get("epochs", 5.0)
     args.max_steps = args.max_steps if args.max_steps is not None else training_cfg.get("max_steps", -1)
@@ -129,32 +127,63 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def load_sft_dataset(data_path: str | Path, tokenizer: AutoTokenizer) -> Dataset:
+def load_sft_dataset(
+    data_path: str | Path,
+    tokenizer,
+    target: str,
+    exclude_indices: set[int] | None = None,
+    max_target_chars: int | None = None,
+    enable_thinking: bool = False,
+) -> Dataset:
     path = Path(data_path)
     with path.open("r", encoding="utf-8") as f:
         rows = json.load(f)
 
     skipped = 0
     examples: list[dict[str, str]] = []
+    exclude_indices = exclude_indices or set()
     for idx, row in enumerate(rows):
-        if not row.get("instruction") or not row.get("rejected"):
+        if idx in exclude_indices:
+            skipped += 1
+            DATA_LOGGER.info("Skipped SFT row index=%d because it is configured in exclude_indices", idx)
+            continue
+        if not row.get("instruction") or not row.get(target):
+            skipped += 1
+            continue
+        if max_target_chars is not None and len(row[target]) > max_target_chars:
+            skipped += 1
+            DATA_LOGGER.info(
+                "Skipped SFT row index=%d because %s length=%d exceeds max_target_chars=%d",
+                idx,
+                target,
+                len(row[target]),
+                max_target_chars,
+            )
+            continue
+
+        messages = [{"role": "user", "content": row["instruction"].strip()}]
+        prompt = apply_chat_template_text(
+            tokenizer,
+            messages,
+            add_generation_prompt=True,
+            enable_thinking=enable_thinking,
+        )
+        completion = row[target].strip()
+        if not completion:
             skipped += 1
             continue
 
-        messages = [
-            {"role": "user", "content": row["instruction"].strip()},
-            {"role": "assistant", "content": row["rejected"].strip()},
-        ]
-        text = tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=False,
-        )
-        examples.append({"text": text})
+        examples.append({"prompt": prompt, "completion": completion})
 
     if not examples:
         raise ValueError(f"{path} does not contain any training examples")
-    DATA_LOGGER.info("Loaded %d SFT examples (skipped=%d) from %s", len(examples), skipped, path)
+    DATA_LOGGER.info(
+        "Loaded %d SFT examples (target=%s, skipped=%d) from %s",
+        len(examples),
+        target,
+        skipped,
+        path,
+    )
     return Dataset.from_list(examples)
 
 
@@ -174,11 +203,12 @@ def main() -> None:
     )
 
     SCRIPT_LOGGER.info(
-        "Starting SFT LoRA training: config=%s model=%s data=%s output=%s epochs=%s max_steps=%s batch=%s grad_accum=%s max_length=%s use_4bit=%s",
+        "Starting SFT LoRA training: config=%s model=%s data=%s output=%s target=%s epochs=%s max_steps=%s batch=%s grad_accum=%s max_length=%s use_4bit=%s",
         args.config,
         args.model_path,
         args.data_path,
         args.output_dir,
+        args.target,
         args.epochs,
         args.max_steps,
         args.batch_size,
@@ -200,7 +230,14 @@ def main() -> None:
         )
 
     tokenizer = create_tokenizer(args.model_path)
-    train_dataset = load_sft_dataset(args.data_path, tokenizer)
+    train_dataset = load_sft_dataset(
+        args.data_path,
+        tokenizer,
+        args.target,
+        exclude_indices=args.exclude_indices,
+        max_target_chars=args.max_target_chars,
+        enable_thinking=args.enable_thinking,
+    )
     model = build_model(args.model_path, use_4bit=args.use_4bit)
     log_cuda_memory("after-model-load")
 
@@ -235,7 +272,7 @@ def main() -> None:
         remove_unused_columns=False,
         optim="adamw_torch_fused",
         seed=args.seed,
-        dataset_text_field="text",
+        completion_only_loss=True,
     )
 
     trainer = SFTTrainer(

@@ -30,6 +30,7 @@ from trl import DPOConfig, DPOTrainer
 from core.logging import get_logger, init_script_logger
 from core.training import (
     CheckpointLoggingCallback,
+    apply_chat_template_text,
     build_model,
     configure_wandb,
     create_tokenizer,
@@ -111,6 +112,7 @@ def parse_args() -> argparse.Namespace:
     args.model_path = args.model_path or model_cfg.get("path", DEFAULT_MODEL_PATH)
     args.data_path = args.data_path or data_cfg.get("path", DEFAULT_DATA_PATH)
     args.output_dir = args.output_dir or output_cfg.get("dir", DEFAULT_OUTPUT_DIR)
+    args.enable_thinking = bool(data_cfg.get("enable_thinking", False))
     args.max_length = args.max_length if args.max_length is not None else data_cfg.get("max_length", 2048)
     args.epochs = args.epochs if args.epochs is not None else training_cfg.get("epochs", 3.0)
     args.max_steps = args.max_steps if args.max_steps is not None else training_cfg.get("max_steps", -1)
@@ -148,7 +150,11 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def load_seed_dataset(data_path: str | Path, tokenizer: AutoTokenizer) -> Dataset:
+def load_seed_dataset(
+    data_path: str | Path,
+    tokenizer: AutoTokenizer,
+    enable_thinking: bool = False,
+) -> Dataset:
     path = Path(data_path)
     with path.open("r", encoding="utf-8") as f:
         rows = json.load(f)
@@ -161,10 +167,11 @@ def load_seed_dataset(data_path: str | Path, tokenizer: AutoTokenizer) -> Datase
             continue
 
         messages = [{"role": "user", "content": row["instruction"].strip()}]
-        prompt = tokenizer.apply_chat_template(
+        prompt = apply_chat_template_text(
+            tokenizer,
             messages,
-            tokenize=False,
             add_generation_prompt=True,
+            enable_thinking=enable_thinking,
         )
 
         examples.append(
@@ -223,7 +230,11 @@ def main() -> None:
         )
 
     tokenizer = create_tokenizer(args.model_path)
-    train_dataset = load_seed_dataset(args.data_path, tokenizer)
+    train_dataset = load_seed_dataset(
+        args.data_path,
+        tokenizer,
+        enable_thinking=args.enable_thinking,
+    )
     model = build_model(args.model_path, use_4bit=args.use_4bit)
     log_cuda_memory("after-model-load")
 

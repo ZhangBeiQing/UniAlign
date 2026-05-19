@@ -1,5 +1,5 @@
 model:
-  path: /root/autodl-tmp/Qwen3.5-4B
+  path: /root/autodl-tmp/Qwen3.5-4B-ortho
   use_4bit: true
   attn_implementation: sdpa
 
@@ -7,12 +7,16 @@ data:
   path: reward_seed.json
 
 output:
-  sft_dir: /root/autodl-tmp/UniAlign-sft-lora
-  dpo_dir: /root/autodl-tmp/UniAlign-dpo-lora
+  sft_dir: /root/autodl-tmp/UniAlign-sft-ortho-lora
+  dpo_dir: /root/autodl-tmp/UniAlign-dpo-ortho-lora
 
 sft:
   target: chosen
-  max_length: 8192
+  enable_thinking: false
+  max_length: 4096
+  exclude_indices:
+    - 28
+  max_target_chars: 12000
   epochs: 30.0
   max_steps: -1
   learning_rate: 2.0e-5
@@ -28,6 +32,7 @@ sft:
     dropout: 0.05
 
 dpo:
+  enable_thinking: false
   max_length: 2048
   epochs: 15.0
   max_steps: -1
