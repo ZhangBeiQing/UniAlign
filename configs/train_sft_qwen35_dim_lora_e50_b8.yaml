@@ -1,0 +1,51 @@
+model:
+  path: /root/autodl-tmp/Qwen3.5-4B-dim-ablation
+  use_4bit: true
+  attn_implementation: sdpa
+
+data:
+  path: sft_question.json
+  target: chosen
+  max_length: 2048
+  exclude_indices: []
+  max_target_chars: 12000
+  enable_thinking: false
+
+output:
+  dir: /root/autodl-tmp/VeriAlign-qwen35-dim-sft-lora-r16-e50-b8
+
+training:
+  epochs: 50
+  max_steps: -1
+  learning_rate: 5.0e-5
+  batch_size: 8
+  grad_accum: 1
+  logging_steps: 1
+  save_steps: 100
+  seed: 42
+
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+
+wandb:
+  enabled: false
+  project: unialign
+  entity: null
+  mode: offline
+  run_name: qwen35-dim-sft-lora-r16-e50-b8
+  group: qwen35-dim-sft-lora
+  report_model: false
+
+runtime:
+  fla_tilelang: "0"
+  triton_f32_default: ieee
