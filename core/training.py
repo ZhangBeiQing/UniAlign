@@ -24,7 +24,7 @@ def build_model(model_path: str, use_4bit: bool) -> AutoModelForCausalLM:
     kwargs = {
         "trust_remote_code": True,
         "attn_implementation": "sdpa",
-        "torch_dtype": torch.bfloat16,
+        "dtype": torch.bfloat16,
         "device_map": "auto",
     }
     if use_4bit:

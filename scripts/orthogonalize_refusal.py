@@ -81,7 +81,7 @@ def main():
     print(f"\nLoading model from {DEFAULT_MODEL_PATH} (CPU)")
     model = AutoModelForCausalLM.from_pretrained(
         DEFAULT_MODEL_PATH,
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         trust_remote_code=True,
         device_map={"": "cpu"},
         low_cpu_mem_usage=True,
